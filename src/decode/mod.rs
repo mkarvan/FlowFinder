@@ -230,7 +230,11 @@ pub struct PacketInfo {
     pub tcp_flags: Option<TcpFlags>,
     pub l7: Option<L7Info>,
     pub tunnel: Option<TunnelInfo>,
+    /// First N bytes of the L7 payload, for hex/ASCII display in the UI.
+    pub payload_preview: Vec<u8>,
 }
+
+pub const PAYLOAD_PREVIEW_MAX: usize = 128;
 
 impl PacketInfo {
     pub fn proto_label(&self) -> String {
@@ -312,6 +316,13 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
         .single()
         .unwrap_or_else(chrono::Local::now);
 
+    let payload_preview = if header_len < raw.data.len() {
+        let end = (header_len + PAYLOAD_PREVIEW_MAX).min(raw.data.len());
+        raw.data[header_len..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
     PacketInfo {
         ts,
         wire_len: raw.origlen as usize,
@@ -326,6 +337,7 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
         tcp_flags,
         l7,
         tunnel,
+        payload_preview,
     }
 }
 

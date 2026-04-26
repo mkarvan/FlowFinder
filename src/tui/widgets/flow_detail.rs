@@ -39,6 +39,24 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
         value(&p.dst.display()),
     ]));
 
+    // Resolved hostnames (if observed via DNS).
+    let src_host = p.src.ip.as_ref().and_then(|ip| app.resolve_ip(ip));
+    let dst_host = p.dst.ip.as_ref().and_then(|ip| app.resolve_ip(ip));
+    if src_host.is_some() || dst_host.is_some() {
+        lines.push(Line::from(vec![
+            label("Host  "),
+            Span::styled(
+                src_host.unwrap_or("—").to_string(),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::raw("   →   "),
+            Span::styled(
+                dst_host.unwrap_or("—").to_string(),
+                Style::default().fg(Color::LightCyan),
+            ),
+        ]));
+    }
+
     // Encap chain
     lines.push(Line::from(vec![
         label("Encap "),
@@ -116,10 +134,64 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
         ]));
     }
 
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    // Payload hex+ASCII dump
+    if !p.payload_preview.is_empty() {
+        lines.push(Line::from(""));
+        let header = format!(
+            "Payload ({} of {} bytes)",
+            p.payload_preview.len(),
+            p.payload_len,
+        );
+        lines.push(Line::from(vec![Span::styled(
+            header,
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        for hex_line in hex_dump_lines(&p.payload_preview) {
+            lines.push(hex_line);
+        }
+    }
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+/// Render up to N rows of `offset  hex bytes  |ASCII|` from a byte slice.
+fn hex_dump_lines(bytes: &[u8]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, chunk) in bytes.chunks(16).enumerate() {
+        let offset = i * 16;
+        let mut hex = String::with_capacity(50);
+        for (j, b) in chunk.iter().enumerate() {
+            if j == 8 {
+                hex.push(' ');
+            }
+            hex.push_str(&format!("{:02x} ", b));
+        }
+        // Pad short last line to keep ASCII column aligned
+        let target = 16 * 3 + 1;
+        while hex.len() < target {
+            hex.push(' ');
+        }
+
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+            .collect();
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:04x}  ", offset),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(hex, Style::default().fg(Color::White)),
+            Span::styled(" |", Style::default().fg(Color::DarkGray)),
+            Span::styled(ascii, Style::default().fg(Color::LightGreen)),
+            Span::styled("|", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
 }
 
 fn l7_detail_lines(l7: &L7Info) -> Vec<Line<'static>> {

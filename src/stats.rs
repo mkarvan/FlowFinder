@@ -191,6 +191,7 @@ mod tests {
             tcp_flags: None,
             l7: None,
             tunnel: None,
+            payload_preview: Vec::new(),
         }
     }
 

@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::time::Instant;
 
 use indexmap::IndexMap;
 
-use crate::decode::PacketInfo;
+use crate::decode::{L7Info, PacketInfo};
 use crate::stats::{FlowKey, StatsState};
 
 const MAX_FLOW_PACKETS: usize = 200;
@@ -25,10 +26,20 @@ pub struct FlowEntry {
     pub last_instant: Instant,
     pub bps: f64,
     pub pps: f64,
+    /// IP for the side that matches `FlowKey::src` (key direction is normalized).
+    pub src_ip: Option<IpAddr>,
+    pub dst_ip: Option<IpAddr>,
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
 }
 
 impl FlowEntry {
-    fn new(p: &PacketInfo) -> Self {
+    fn new(p: &PacketInfo, key: &FlowKey) -> Self {
+        let (src_ip, dst_ip, src_port, dst_port) = if p.src.display() == key.src {
+            (p.src.ip, p.dst.ip, p.src.port, p.dst.port)
+        } else {
+            (p.dst.ip, p.src.ip, p.dst.port, p.src.port)
+        };
         FlowEntry {
             packets: VecDeque::with_capacity(MAX_FLOW_PACKETS),
             total_packets: 0,
@@ -38,6 +49,10 @@ impl FlowEntry {
             last_instant: Instant::now(),
             bps: 0.0,
             pps: 0.0,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
         }
     }
 
@@ -89,6 +104,8 @@ pub struct AppState {
     pub interface_name: String,
     /// Follow the most recently active flow in the flow list.
     pub flow_auto_scroll: bool,
+    /// IP → hostname snooped from observed DNS responses.
+    pub hostname_cache: HashMap<IpAddr, String>,
 }
 
 impl AppState {
@@ -109,6 +126,7 @@ impl AppState {
             filter_error: None,
             interface_name,
             flow_auto_scroll: true,
+            hostname_cache: HashMap::new(),
         }
     }
 
@@ -117,6 +135,18 @@ impl AppState {
             return;
         }
         self.stats.ingest(&p);
+
+        // Snoop DNS responses to learn IP→hostname mappings.
+        if let Some(L7Info::Dns { query, answers, is_response: true, .. }) = &p.l7 {
+            if !query.is_empty() {
+                for ans in answers {
+                    if let Ok(ip) = ans.parse::<IpAddr>() {
+                        self.hostname_cache.insert(ip, query.clone());
+                    }
+                }
+            }
+        }
+
         let key = FlowKey::from_packet(&p);
 
         // Evict the oldest-seen flow if we're at capacity and this is a new flow.
@@ -136,7 +166,11 @@ impl AppState {
         }
 
         let is_new = !self.flow_table.contains_key(&key);
-        let entry = self.flow_table.entry(key.clone()).or_insert_with(|| FlowEntry::new(&p));
+        let key_for_new = key.clone();
+        let entry = self
+            .flow_table
+            .entry(key.clone())
+            .or_insert_with(|| FlowEntry::new(&p, &key_for_new));
         entry.ingest(p);
 
         // Auto-scroll flow list to newest flow on insertion.
@@ -258,6 +292,12 @@ impl AppState {
         self.flow_pkt_sel = 0;
         self.flow_pkt_scroll = 0;
         self.stats = StatsState::new();
+        self.hostname_cache.clear();
+    }
+
+    /// Look up a hostname for the given IP from snooped DNS responses.
+    pub fn resolve_ip(&self, ip: &IpAddr) -> Option<&str> {
+        self.hostname_cache.get(ip).map(|s| s.as_str())
     }
 
     pub fn toggle_pause(&mut self) {
@@ -311,6 +351,7 @@ mod tests {
             tcp_flags: None,
             l7: None,
             tunnel: None,
+            payload_preview: Vec::new(),
         }
     }
 
@@ -433,6 +474,55 @@ mod tests {
         assert!(app.open_flow.is_none());
         assert_eq!(app.selected_flow, 0);
         assert_eq!(app.stats.total_packets, 0);
+    }
+
+    #[test]
+    fn test_dns_response_populates_hostname_cache() {
+        let mut app = AppState::new("en0".into());
+        let mut p = make_packet([192,168,1,1], 53, [192,168,1,2], 5353, 200);
+        p.l7 = Some(crate::decode::L7Info::Dns {
+            query: "example.com".into(),
+            qtype: "A".into(),
+            answers: vec!["93.184.216.34".into(), "93.184.216.35".into()],
+            is_response: true,
+        });
+        app.add_packet(p);
+
+        let ip1: IpAddr = "93.184.216.34".parse().unwrap();
+        let ip2: IpAddr = "93.184.216.35".parse().unwrap();
+        assert_eq!(app.resolve_ip(&ip1), Some("example.com"));
+        assert_eq!(app.resolve_ip(&ip2), Some("example.com"));
+    }
+
+    #[test]
+    fn test_dns_query_does_not_populate_cache() {
+        let mut app = AppState::new("en0".into());
+        let mut p = make_packet([192,168,1,2], 5353, [192,168,1,1], 53, 80);
+        p.l7 = Some(crate::decode::L7Info::Dns {
+            query: "example.com".into(),
+            qtype: "A".into(),
+            answers: vec![],
+            is_response: false,
+        });
+        app.add_packet(p);
+        assert!(app.hostname_cache.is_empty());
+    }
+
+    #[test]
+    fn test_flow_entry_records_canonical_ips_and_ports() {
+        let mut app = AppState::new("en0".into());
+        // Send the reverse-direction packet first to exercise the swap.
+        app.add_packet(make_packet([8,8,8,8], 443, [192,168,1,5], 54321, 100));
+        let (key, entry) = app.flow_table.get_index(0).unwrap();
+        // FlowKey normalizes by string ordering — entry.src_ip must align with key.src
+        let displayed_src = entry
+            .src_ip
+            .map(|ip| match entry.src_port {
+                Some(port) => format!("{}:{}", ip, port),
+                None => ip.to_string(),
+            })
+            .unwrap_or_default();
+        assert_eq!(displayed_src, key.src);
     }
 
     #[test]

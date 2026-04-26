@@ -28,15 +28,24 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
         "—".into()
     };
 
-    let lines = vec![
-        Line::from(vec![
-            label("Src  "),
-            value(&key.src),
-        ]),
-        Line::from(vec![
-            label("Dst  "),
-            value(&key.dst),
-        ]),
+    let src_host = entry.src_ip.as_ref().and_then(|ip| app.resolve_ip(ip));
+    let dst_host = entry.dst_ip.as_ref().and_then(|ip| app.resolve_ip(ip));
+
+    let mut lines = vec![Line::from(vec![label("Src  "), value(&key.src)])];
+    if let Some(h) = src_host {
+        lines.push(Line::from(vec![
+            label("     "),
+            Span::styled(h.to_string(), Style::default().fg(Color::LightCyan)),
+        ]));
+    }
+    lines.push(Line::from(vec![label("Dst  "), value(&key.dst)]));
+    if let Some(h) = dst_host {
+        lines.push(Line::from(vec![
+            label("     "),
+            Span::styled(h.to_string(), Style::default().fg(Color::LightCyan)),
+        ]));
+    }
+    lines.extend(vec![
         Line::from(vec![
             label("Proto"),
             value(&key.proto),
@@ -63,7 +72,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
                 Style::default().fg(Color::Cyan),
             ),
         ]),
-    ];
+    ]);
 
     let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);

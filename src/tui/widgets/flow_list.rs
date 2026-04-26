@@ -38,7 +38,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut AppState) {
         .flow_table
         .iter()
         .map(|(key, entry)| {
-            let src_dst = format!("{} → {}", key.src, key.dst);
+            let src_label = endpoint_label(
+                entry.src_ip.as_ref().and_then(|ip| app.hostname_cache.get(ip)).map(|s| s.as_str()),
+                entry.src_port,
+                &key.src,
+            );
+            let dst_label = endpoint_label(
+                entry.dst_ip.as_ref().and_then(|ip| app.hostname_cache.get(ip)).map(|s| s.as_str()),
+                entry.dst_port,
+                &key.dst,
+            );
+            let src_dst = format!("{} → {}", src_label, dst_label);
             let rate = StatsState::format_bps(entry.bps);
             let age = format_age(entry.duration_secs());
             let bytes = format_bytes(entry.total_bytes);
@@ -96,6 +106,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut AppState) {
     *state.offset_mut() = app.flow_scroll;
 
     f.render_stateful_widget(table, area, &mut state);
+}
+
+fn endpoint_label(host: Option<&str>, port: Option<u16>, fallback: &str) -> String {
+    match (host, port) {
+        (Some(h), Some(p)) => format!("{}:{}", h, p),
+        (Some(h), None) => h.to_string(),
+        _ => fallback.to_string(),
+    }
 }
 
 fn format_age(secs: f64) -> String {
