@@ -352,6 +352,7 @@ mod tests {
             l7: None,
             tunnel: None,
             payload_preview: Vec::new(),
+            headers: crate::decode::Headers::default(),
         }
     }
 

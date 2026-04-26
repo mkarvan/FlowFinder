@@ -6,7 +6,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::decode::{L7Info, TunnelInfo};
+use crate::decode::{
+    IcmpDetails, Ipv4Details, Ipv6Details, L7Info, TcpDetails, TunnelInfo, VlanInfo,
+};
 use crate::tui::app::{AppState, FocusPane};
 
 pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
@@ -75,13 +77,31 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
         value(&format!("{} bytes (hdr {}B payload {}B)", p.wire_len, p.header_len, p.payload_len)),
     ]));
 
-    // L3/L4 info
+    // VLAN
+    if let Some(ref v) = p.headers.vlan {
+        for line in vlan_lines(v) {
+            lines.push(line);
+        }
+    }
+
+    // L3 + IPv4/IPv6 details
     let mut l3_info = p.l3_proto.as_str().to_string();
     if let Some(ttl) = p.ttl {
         l3_info.push_str(&format!("  TTL {}", ttl));
     }
     lines.push(Line::from(vec![label("L3    "), value(&l3_info)]));
+    if let Some(ref ip4) = p.headers.ipv4 {
+        for line in ipv4_lines(ip4) {
+            lines.push(line);
+        }
+    }
+    if let Some(ref ip6) = p.headers.ipv6 {
+        for line in ipv6_lines(ip6) {
+            lines.push(line);
+        }
+    }
 
+    // L4 + TCP/ICMP details
     if let Some(ref l4) = p.l4_proto {
         let mut l4_info = l4.as_str().to_string();
         if let Some(ref flags) = p.tcp_flags {
@@ -91,6 +111,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
             }
         }
         lines.push(Line::from(vec![label("L4    "), value(&l4_info)]));
+
+        if let Some(ref tcp) = p.headers.tcp {
+            for line in tcp_lines(tcp) {
+                lines.push(line);
+            }
+        }
+        if let Some(ref icmp) = p.headers.icmp {
+            for line in icmp_lines(icmp) {
+                lines.push(line);
+            }
+        }
     }
 
     // L7 details
@@ -260,6 +291,117 @@ fn tunnel_lines(tun: &TunnelInfo) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![label("  ID   "), value(&id_str)]));
     }
     lines
+}
+
+fn vlan_lines(v: &VlanInfo) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        label("VLAN  "),
+        value(&format!("VID {}  PCP {}  DEI {}", v.vid, v.pcp, v.dei as u8)),
+    ])]
+}
+
+fn ipv4_lines(ip: &Ipv4Details) -> Vec<Line<'static>> {
+    let mut frag_flags = Vec::new();
+    if ip.df { frag_flags.push("DF"); }
+    if ip.mf { frag_flags.push("MF"); }
+    let frag_label = if frag_flags.is_empty() { "—".to_string() } else { frag_flags.join(" ") };
+    vec![
+        Line::from(vec![
+            label("  IHL "),
+            value(&format!("{}B", ip.ihl_bytes)),
+            Span::raw("  "),
+            label("DSCP "),
+            value(&format!("{:#04x}", ip.dscp)),
+            Span::raw("  "),
+            label("ECN "),
+            value(&format!("{:#04b}", ip.ecn)),
+            Span::raw("  "),
+            label("Total "),
+            value(&format!("{}B", ip.total_len)),
+        ]),
+        Line::from(vec![
+            label("  ID  "),
+            value(&format!("{:#06x}", ip.id)),
+            Span::raw("  "),
+            label("Frag "),
+            value(&format!("[{}] off {}", frag_label, ip.frag_offset)),
+            Span::raw("  "),
+            label("Cksum "),
+            value(&format!("{:#06x}", ip.checksum)),
+        ]),
+    ]
+}
+
+fn ipv6_lines(ip: &Ipv6Details) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        label("  TC  "),
+        value(&format!("{:#04x}", ip.traffic_class)),
+        Span::raw("  "),
+        label("FlowLabel "),
+        value(&format!("{:#07x}", ip.flow_label)),
+        Span::raw("  "),
+        label("Plen "),
+        value(&format!("{}B", ip.payload_length)),
+        Span::raw("  "),
+        label("Next "),
+        value(&ip.next_header.to_string()),
+    ])]
+}
+
+fn tcp_lines(t: &TcpDetails) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            label("  Seq "),
+            value(&t.seq.to_string()),
+            Span::raw("   "),
+            label("Ack "),
+            value(&t.ack.to_string()),
+        ]),
+        Line::from(vec![
+            label("  Win "),
+            value(&t.window.to_string()),
+            Span::raw("  "),
+            label("DataOff "),
+            value(&format!("{}B", t.data_offset_bytes)),
+            Span::raw("  "),
+            label("UrgPtr "),
+            value(&t.urg_ptr.to_string()),
+            Span::raw("  "),
+            label("Cksum "),
+            value(&format!("{:#06x}", t.checksum)),
+        ]),
+    ];
+    let mut opts: Vec<String> = Vec::new();
+    if let Some(mss) = t.mss { opts.push(format!("MSS={}", mss)); }
+    if let Some(ws) = t.window_scale { opts.push(format!("WS={}", ws)); }
+    if t.sack_permitted { opts.push("SACKp".into()); }
+    if let Some((tsval, tsecr)) = t.timestamps { opts.push(format!("TS=({},{})", tsval, tsecr)); }
+    if !opts.is_empty() {
+        lines.push(Line::from(vec![
+            label("  Opts"),
+            Span::raw(" "),
+            value(&opts.join("  ")),
+        ]));
+    }
+    lines
+}
+
+fn icmp_lines(i: &IcmpDetails) -> Vec<Line<'static>> {
+    let type_str = match i.type_name {
+        Some(name) => format!("{} ({})", i.icmp_type, name),
+        None => i.icmp_type.to_string(),
+    };
+    vec![Line::from(vec![
+        label("  Type"),
+        Span::raw(" "),
+        value(&type_str),
+        Span::raw("   "),
+        label("Code "),
+        value(&i.code.to_string()),
+        Span::raw("   "),
+        label("Cksum "),
+        value(&format!("{:#06x}", i.checksum)),
+    ])]
 }
 
 fn label(s: &str) -> Span<'static> {

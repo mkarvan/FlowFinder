@@ -79,7 +79,7 @@ impl L4Proto {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TcpFlags {
     pub syn: bool,
     pub ack: bool,
@@ -87,6 +87,9 @@ pub struct TcpFlags {
     pub rst: bool,
     pub psh: bool,
     pub urg: bool,
+    pub ece: bool,
+    pub cwr: bool,
+    pub ns: bool,
 }
 
 impl TcpFlags {
@@ -98,8 +101,70 @@ impl TcpFlags {
         if self.rst { flags.push("RST"); }
         if self.psh { flags.push("PSH"); }
         if self.urg { flags.push("URG"); }
+        if self.ece { flags.push("ECE"); }
+        if self.cwr { flags.push("CWR"); }
+        if self.ns  { flags.push("NS"); }
         flags.join(" ")
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct VlanInfo {
+    pub vid: u16,
+    pub pcp: u8,
+    pub dei: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ipv4Details {
+    pub ihl_bytes: u8,
+    pub dscp: u8,
+    pub ecn: u8,
+    pub total_len: u16,
+    pub id: u16,
+    pub df: bool,
+    pub mf: bool,
+    pub frag_offset: u16,
+    pub checksum: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ipv6Details {
+    pub traffic_class: u8,
+    pub flow_label: u32,
+    pub payload_length: u16,
+    pub next_header: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpDetails {
+    pub seq: u32,
+    pub ack: u32,
+    pub data_offset_bytes: u8,
+    pub window: u16,
+    pub checksum: u16,
+    pub urg_ptr: u16,
+    pub mss: Option<u16>,
+    pub window_scale: Option<u8>,
+    pub sack_permitted: bool,
+    pub timestamps: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IcmpDetails {
+    pub icmp_type: u8,
+    pub code: u8,
+    pub checksum: u16,
+    pub type_name: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Headers {
+    pub vlan: Option<VlanInfo>,
+    pub ipv4: Option<Ipv4Details>,
+    pub ipv6: Option<Ipv6Details>,
+    pub tcp: Option<TcpDetails>,
+    pub icmp: Option<IcmpDetails>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +297,8 @@ pub struct PacketInfo {
     pub tunnel: Option<TunnelInfo>,
     /// First N bytes of the L7 payload, for hex/ASCII display in the UI.
     pub payload_preview: Vec<u8>,
+    /// Per-protocol header detail (VLAN, IPv4, IPv6, TCP, ICMP).
+    pub headers: Headers,
 }
 
 pub const PAYLOAD_PREVIEW_MAX: usize = 128;
@@ -264,13 +331,15 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
     let mut tcp_flags: Option<TcpFlags> = None;
     let mut l7: Option<L7Info> = None;
     let mut tunnel: Option<TunnelInfo> = None;
+    let mut headers = Headers::default();
 
     // DLT_EN10MB = 1, DLT_NULL = 0, DLT_LOOP = 108, DLT_RAW = 101/12
     let ip_data: Option<&[u8]> = match raw.datalink {
         1 => {
             // Ethernet
-            parse_ethernet(&raw.data, &mut encap, &mut src, &mut dst, &mut header_len);
-            if raw.data.len() > 14 { Some(&raw.data[14..]) } else { None }
+            parse_ethernet(&raw.data, &mut encap, &mut src, &mut dst, &mut header_len, &mut headers);
+            let off = ethernet_header_len(&raw.data);
+            if raw.data.len() > off { Some(&raw.data[off..]) } else { None }
         }
         0 | 108 => {
             // BSD null/loopback: 4-byte AF family + IP
@@ -288,8 +357,9 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
         }
         _ => {
             // Try ethernet anyway
-            parse_ethernet(&raw.data, &mut encap, &mut src, &mut dst, &mut header_len);
-            if raw.data.len() > 14 { Some(&raw.data[14..]) } else { None }
+            parse_ethernet(&raw.data, &mut encap, &mut src, &mut dst, &mut header_len, &mut headers);
+            let off = ethernet_header_len(&raw.data);
+            if raw.data.len() > off { Some(&raw.data[off..]) } else { None }
         }
     };
 
@@ -307,6 +377,7 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
             &mut tcp_flags,
             &mut l7,
             &mut tunnel,
+            &mut headers,
         );
     }
 
@@ -338,7 +409,16 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
         l7,
         tunnel,
         payload_preview,
+        headers,
     }
+}
+
+fn ethernet_header_len(data: &[u8]) -> usize {
+    if data.len() < 14 {
+        return 0;
+    }
+    let etype = u16::from_be_bytes([data[12], data[13]]);
+    if etype == 0x8100 && data.len() >= 18 { 18 } else { 14 }
 }
 
 fn parse_ethernet(
@@ -347,6 +427,7 @@ fn parse_ethernet(
     src: &mut Endpoint,
     dst: &mut Endpoint,
     header_len: &mut usize,
+    headers: &mut Headers,
 ) {
     if data.len() < 14 {
         return;
@@ -360,6 +441,12 @@ fn parse_ethernet(
     if etype == 0x8100 && data.len() >= 18 {
         encap.push("802.1Q".to_string());
         *header_len += 4;
+        let tci = u16::from_be_bytes([data[14], data[15]]);
+        headers.vlan = Some(VlanInfo {
+            pcp: ((tci >> 13) & 0x07) as u8,
+            dei: (tci & 0x1000) != 0,
+            vid: tci & 0x0fff,
+        });
     }
 }
 
@@ -377,14 +464,15 @@ fn parse_ip(
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
     tunnel: &mut Option<TunnelInfo>,
+    headers: &mut Headers,
 ) {
     if data.is_empty() {
         return;
     }
 
     match data[0] >> 4 {
-        4 => parse_ipv4(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel),
-        6 => parse_ipv6(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel),
+        4 => parse_ipv4(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel, headers),
+        6 => parse_ipv6(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel, headers),
         _ => {
             // ARP (ethertype 0x0806) or unknown
             if data.len() >= 8 {
@@ -420,6 +508,7 @@ fn parse_ipv4(
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
     tunnel: &mut Option<TunnelInfo>,
+    headers: &mut Headers,
 ) {
     if data.len() < 20 {
         return;
@@ -434,10 +523,23 @@ fn parse_ipv4(
     src.ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15])));
     dst.ip = Some(IpAddr::V4(std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19])));
 
+    let flags_frag = u16::from_be_bytes([data[6], data[7]]);
+    headers.ipv4 = Some(Ipv4Details {
+        ihl_bytes: ihl as u8,
+        dscp: data[1] >> 2,
+        ecn: data[1] & 0x03,
+        total_len: total_len as u16,
+        id: u16::from_be_bytes([data[4], data[5]]),
+        df: flags_frag & 0x4000 != 0,
+        mf: flags_frag & 0x2000 != 0,
+        frag_offset: (flags_frag & 0x1fff) * 8,
+        checksum: u16::from_be_bytes([data[10], data[11]]),
+    });
+
     if ihl <= total_len && ihl <= data.len() {
         let transport_data = &data[ihl..];
         let transport_len = total_len.saturating_sub(ihl);
-        parse_transport(proto, transport_data, transport_len, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel);
+        parse_transport(proto, transport_data, transport_len, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel, headers);
     }
 }
 
@@ -455,6 +557,7 @@ fn parse_ipv6(
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
     tunnel: &mut Option<TunnelInfo>,
+    headers: &mut Headers,
 ) {
     if data.len() < 40 {
         return;
@@ -466,6 +569,17 @@ fn parse_ipv6(
     *ttl = Some(data[7]); // hop limit
     let next_header = data[6];
 
+    let traffic_class = ((data[0] & 0x0f) << 4) | (data[1] >> 4);
+    let flow_label = ((data[1] as u32 & 0x0f) << 16)
+        | ((data[2] as u32) << 8)
+        | (data[3] as u32);
+    headers.ipv6 = Some(Ipv6Details {
+        traffic_class,
+        flow_label,
+        payload_length: payload_length as u16,
+        next_header,
+    });
+
     let src_bytes: [u8; 16] = data[8..24].try_into().unwrap_or_default();
     let dst_bytes: [u8; 16] = data[24..40].try_into().unwrap_or_default();
     src.ip = Some(IpAddr::V6(std::net::Ipv6Addr::from(src_bytes)));
@@ -473,7 +587,7 @@ fn parse_ipv6(
 
     if data.len() >= 40 {
         let transport_data = &data[40..];
-        parse_transport(next_header, transport_data, payload_length, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel);
+        parse_transport(next_header, transport_data, payload_length, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel, headers);
     }
 }
 
@@ -493,6 +607,7 @@ fn parse_transport(
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
     tunnel: &mut Option<TunnelInfo>,
+    headers: &mut Headers,
 ) {
     match proto {
         6 => {
@@ -515,7 +630,24 @@ fn parse_transport(
                 psh: flags_byte & 0x08 != 0,
                 ack: flags_byte & 0x10 != 0,
                 urg: flags_byte & 0x20 != 0,
+                ece: flags_byte & 0x40 != 0,
+                cwr: flags_byte & 0x80 != 0,
+                ns:  data[12]    & 0x01 != 0,
             });
+
+            let seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+            let ack = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+            let window = u16::from_be_bytes([data[14], data[15]]);
+            let checksum = u16::from_be_bytes([data[16], data[17]]);
+            let urg_ptr = u16::from_be_bytes([data[18], data[19]]);
+            let (mss, window_scale, sack_permitted, timestamps) =
+                parse_tcp_options(&data[20..data_offset.min(data.len())]);
+            headers.tcp = Some(TcpDetails {
+                seq, ack, data_offset_bytes: data_offset as u8,
+                window, checksum, urg_ptr,
+                mss, window_scale, sack_permitted, timestamps,
+            });
+
             *header_len += data_offset;
             *payload_len = transport_len.saturating_sub(data_offset);
             let app_data = &data[data_offset.min(data.len())..];
@@ -567,7 +699,7 @@ fn parse_transport(
                         &inner_eth[14..],
                         encap, src, dst, l3_proto, l4_proto, ttl,
                         header_len, payload_len, tcp_flags, l7,
-                        &mut inner_tunnel,
+                        &mut inner_tunnel, headers,
                     );
                 }
                 return;
@@ -584,6 +716,16 @@ fn parse_transport(
             *l4_proto = Some(L4Proto::Icmp);
             *header_len += 8;
             *payload_len = transport_len.saturating_sub(8);
+            if data.len() >= 4 {
+                let t = data[0];
+                let code = data[1];
+                headers.icmp = Some(IcmpDetails {
+                    icmp_type: t,
+                    code,
+                    checksum: u16::from_be_bytes([data[2], data[3]]),
+                    type_name: icmpv4_type_name(t),
+                });
+            }
         }
         58 => {
             // ICMPv6
@@ -591,6 +733,16 @@ fn parse_transport(
             *l4_proto = Some(L4Proto::Icmpv6);
             *header_len += 8;
             *payload_len = transport_len.saturating_sub(8);
+            if data.len() >= 4 {
+                let t = data[0];
+                let code = data[1];
+                headers.icmp = Some(IcmpDetails {
+                    icmp_type: t,
+                    code,
+                    checksum: u16::from_be_bytes([data[2], data[3]]),
+                    type_name: icmpv6_type_name(t),
+                });
+            }
         }
         // IP-in-IP (proto 4): outer IPv4 wraps inner IPv4
         4 => {
@@ -608,7 +760,7 @@ fn parse_transport(
                 });
             }
             let mut inner_tunnel = None;
-            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel, headers);
         }
         // IPv6-in-IPv4 (proto 41): 6in4 tunnel
         41 => {
@@ -626,7 +778,7 @@ fn parse_transport(
                 });
             }
             let mut inner_tunnel = None;
-            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel, headers);
         }
         // GRE (proto 47): Generic Routing Encapsulation
         47 => {
@@ -673,13 +825,13 @@ fn parse_transport(
                 let mut inner_tunnel = None;
                 match proto_type {
                     0x0800 | 0x86DD => {
-                        parse_ip(inner, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+                        parse_ip(inner, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel, headers);
                     }
                     0x6558 => {
                         // Transparent Ethernet Bridging in GRE
                         if inner.len() > 14 {
                             encap.push("Ethernet".to_string());
-                            parse_ip(&inner[14..], encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+                            parse_ip(&inner[14..], encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel, headers);
                         }
                     }
                     _ => {}
@@ -689,6 +841,72 @@ fn parse_transport(
         _ => {
             *l4_proto = Some(L4Proto::Other(proto));
         }
+    }
+}
+
+/// Parse TCP options between bytes 20 and `data_offset*4`.
+/// Recognised: MSS (kind 2), WindowScale (kind 3), SACKp (kind 4), Timestamps (kind 8).
+fn parse_tcp_options(opts: &[u8]) -> (Option<u16>, Option<u8>, bool, Option<(u32, u32)>) {
+    let mut mss = None;
+    let mut window_scale = None;
+    let mut sack_permitted = false;
+    let mut timestamps = None;
+
+    let mut i = 0;
+    while i < opts.len() {
+        let kind = opts[i];
+        if kind == 0 { break; }            // EOL
+        if kind == 1 { i += 1; continue; } // NOP
+        if i + 1 >= opts.len() { break; }
+        let len = opts[i + 1] as usize;
+        if len < 2 || i + len > opts.len() { break; }
+        match (kind, len) {
+            (2, 4) => mss = Some(u16::from_be_bytes([opts[i + 2], opts[i + 3]])),
+            (3, 3) => window_scale = Some(opts[i + 2]),
+            (4, 2) => sack_permitted = true,
+            (8, 10) => {
+                let tsval = u32::from_be_bytes([opts[i + 2], opts[i + 3], opts[i + 4], opts[i + 5]]);
+                let tsecr = u32::from_be_bytes([opts[i + 6], opts[i + 7], opts[i + 8], opts[i + 9]]);
+                timestamps = Some((tsval, tsecr));
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    (mss, window_scale, sack_permitted, timestamps)
+}
+
+fn icmpv4_type_name(t: u8) -> Option<&'static str> {
+    match t {
+        0 => Some("Echo Reply"),
+        3 => Some("Dest Unreachable"),
+        4 => Some("Source Quench"),
+        5 => Some("Redirect"),
+        8 => Some("Echo Request"),
+        9 => Some("Router Advertisement"),
+        10 => Some("Router Solicitation"),
+        11 => Some("Time Exceeded"),
+        12 => Some("Parameter Problem"),
+        13 => Some("Timestamp Request"),
+        14 => Some("Timestamp Reply"),
+        _ => None,
+    }
+}
+
+fn icmpv6_type_name(t: u8) -> Option<&'static str> {
+    match t {
+        1 => Some("Dest Unreachable"),
+        2 => Some("Packet Too Big"),
+        3 => Some("Time Exceeded"),
+        4 => Some("Parameter Problem"),
+        128 => Some("Echo Request"),
+        129 => Some("Echo Reply"),
+        133 => Some("Router Solicitation"),
+        134 => Some("Router Advertisement"),
+        135 => Some("Neighbor Solicitation"),
+        136 => Some("Neighbor Advertisement"),
+        137 => Some("Redirect"),
+        _ => None,
     }
 }
 
@@ -1289,5 +1507,100 @@ mod tests {
         let raw = eth_ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 12345, 443, 0x02, b"");
         let p = decode(&raw);
         assert!(p.tunnel.is_none());
+    }
+
+    // ── header detail tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_ipv4_details_populated() {
+        let raw = eth_ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 1000, 80, 0x02, b"");
+        let p = decode(&raw);
+        let ip = p.headers.ipv4.expect("ipv4 details set for IPv4 packet");
+        assert_eq!(ip.ihl_bytes, 20);
+        assert_eq!(ip.id, 1);
+        assert!(!ip.df);
+        assert!(!ip.mf);
+        assert_eq!(ip.frag_offset, 0);
+    }
+
+    #[test]
+    fn test_tcp_details_seq_ack_window_populated() {
+        let raw = eth_ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 1000, 80, 0x10, b"");
+        let p = decode(&raw);
+        let tcp = p.headers.tcp.expect("tcp details set for TCP packet");
+        assert_eq!(tcp.seq, 1);
+        assert_eq!(tcp.ack, 0);
+        assert_eq!(tcp.window, 0xffff);
+        assert_eq!(tcp.data_offset_bytes, 20);
+    }
+
+    #[test]
+    fn test_tcp_extended_flags_ece_cwr() {
+        // bit 6 = ECE, bit 7 = CWR
+        let raw = eth_ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 1000, 80, 0xC0, b"");
+        let p = decode(&raw);
+        let flags = p.tcp_flags.expect("tcp flags set");
+        assert!(flags.ece);
+        assert!(flags.cwr);
+    }
+
+    #[test]
+    fn test_tcp_options_parsed() {
+        // MSS=1460, WS=7, SACKp, TS=(0x11223344, 0x55667788)
+        let opts = [
+            0x02, 0x04, 0x05, 0xb4, // MSS 1460
+            0x03, 0x03, 0x07,       // WS 7
+            0x04, 0x02,             // SACK permitted
+            0x08, 0x0a,
+            0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88, // TS
+            0x00,                   // EOL
+        ];
+        let (mss, ws, sackp, ts) = parse_tcp_options(&opts);
+        assert_eq!(mss, Some(1460));
+        assert_eq!(ws, Some(7));
+        assert!(sackp);
+        assert_eq!(ts, Some((0x11223344, 0x55667788)));
+    }
+
+    #[test]
+    fn test_tcp_options_handles_nops() {
+        let opts = [0x01, 0x01, 0x02, 0x04, 0x05, 0xb4, 0x00];
+        let (mss, _, _, _) = parse_tcp_options(&opts);
+        assert_eq!(mss, Some(1460));
+    }
+
+    #[test]
+    fn test_icmp_details_populated_with_type_name() {
+        let raw = eth_ipv4_icmp([1, 2, 3, 4], [5, 6, 7, 8]);
+        let p = decode(&raw);
+        let icmp = p.headers.icmp.expect("icmp details set for ICMP packet");
+        assert_eq!(icmp.icmp_type, 8);
+        assert_eq!(icmp.code, 0);
+        assert_eq!(icmp.type_name, Some("Echo Request"));
+    }
+
+    #[test]
+    fn test_vlan_tagged_packet_extracts_vid() {
+        // Ethernet + 802.1Q tag (VID=100, PCP=3) + IPv4 + UDP
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xaa; 6]);
+        data.extend_from_slice(&[0xbb; 6]);
+        data.extend_from_slice(&[0x81, 0x00]);                   // VLAN ethertype
+        data.extend_from_slice(&[(3 << 5) | 0x00, 0x64]);        // PCP 3, DEI 0, VID 100
+        data.extend_from_slice(&[0x08, 0x00]);                   // inner ethertype IPv4
+        // Minimal IPv4+UDP
+        data.push(0x45); data.push(0x00);
+        data.extend_from_slice(&[0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 17, 0x00, 0x00]);
+        data.extend_from_slice(&[1, 1, 1, 1, 2, 2, 2, 2]);
+        data.extend_from_slice(&[0x00, 0x35, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]);
+        let raw = RawPacket { data, ts_sec: 0, ts_usec: 0, _caplen: 0, origlen: 0, datalink: 1 };
+        let p = decode(&raw);
+        let v = p.headers.vlan.expect("vlan info populated");
+        assert_eq!(v.vid, 100);
+        assert_eq!(v.pcp, 3);
+        assert!(!v.dei);
+        assert!(p.encap_chain.contains(&"802.1Q".to_string()));
+        assert_eq!(p.l4_proto, Some(L4Proto::Udp));
     }
 }
