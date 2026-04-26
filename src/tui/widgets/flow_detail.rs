@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::decode::L7Info;
+use crate::decode::{L7Info, TunnelInfo};
 use crate::tui::app::{AppState, FocusPane};
 
 pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
@@ -89,6 +89,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
         }
     }
 
+    // Tunnel info
+    if let Some(ref tun) = p.tunnel {
+        for line in tunnel_lines(tun) {
+            lines.push(line);
+        }
+    }
+
     // MAC addresses if present
     if let Some(mac) = p.src.mac {
         lines.push(Line::from(vec![
@@ -161,6 +168,26 @@ fn l7_detail_lines(l7: &L7Info) -> Vec<Line<'static>> {
         }
         L7Info::Http2 => vec![Line::from(vec![value("HTTP/2 client preface")])],
     }
+}
+
+fn tunnel_lines(tun: &TunnelInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            label("Tunnel"),
+            Span::styled(
+                tun.proto.name(),
+                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            label("  Outer"),
+            value(&format!("{} → {}", tun.outer_src, tun.outer_dst)),
+        ]),
+    ];
+    if let Some(id_str) = tun.id_label() {
+        lines.push(Line::from(vec![label("  ID   "), value(&id_str)]));
+    }
+    lines
 }
 
 fn label(s: &str) -> Span<'static> {

@@ -178,6 +178,43 @@ impl L7Info {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelProto {
+    Gre,
+    IpIp,
+    Ipv6InIp,
+    Vxlan,
+}
+
+impl TunnelProto {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TunnelProto::Gre => "GRE",
+            TunnelProto::IpIp => "IPIP",
+            TunnelProto::Ipv6InIp => "IPv6-in-IPv4",
+            TunnelProto::Vxlan => "VXLAN",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelInfo {
+    pub proto: TunnelProto,
+    pub outer_src: IpAddr,
+    pub outer_dst: IpAddr,
+    pub tunnel_id: Option<u32>,
+}
+
+impl TunnelInfo {
+    pub fn id_label(&self) -> Option<String> {
+        self.tunnel_id.map(|id| match self.proto {
+            TunnelProto::Vxlan => format!("VNI {}", id),
+            TunnelProto::Gre => format!("Key {:#010x}", id),
+            _ => id.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketInfo {
     pub ts: chrono::DateTime<chrono::Local>,
@@ -192,6 +229,7 @@ pub struct PacketInfo {
     pub payload_len: usize,
     pub tcp_flags: Option<TcpFlags>,
     pub l7: Option<L7Info>,
+    pub tunnel: Option<TunnelInfo>,
 }
 
 impl PacketInfo {
@@ -221,6 +259,7 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
     let mut payload_len: usize = 0;
     let mut tcp_flags: Option<TcpFlags> = None;
     let mut l7: Option<L7Info> = None;
+    let mut tunnel: Option<TunnelInfo> = None;
 
     // DLT_EN10MB = 1, DLT_NULL = 0, DLT_LOOP = 108, DLT_RAW = 101/12
     let ip_data: Option<&[u8]> = match raw.datalink {
@@ -263,6 +302,7 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
             &mut payload_len,
             &mut tcp_flags,
             &mut l7,
+            &mut tunnel,
         );
     }
 
@@ -285,6 +325,7 @@ pub fn decode(raw: &RawPacket) -> PacketInfo {
         payload_len,
         tcp_flags,
         l7,
+        tunnel,
     }
 }
 
@@ -323,14 +364,15 @@ fn parse_ip(
     payload_len: &mut usize,
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
+    tunnel: &mut Option<TunnelInfo>,
 ) {
     if data.is_empty() {
         return;
     }
 
     match data[0] >> 4 {
-        4 => parse_ipv4(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7),
-        6 => parse_ipv6(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7),
+        4 => parse_ipv4(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel),
+        6 => parse_ipv6(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel),
         _ => {
             // ARP (ethertype 0x0806) or unknown
             if data.len() >= 8 {
@@ -365,6 +407,7 @@ fn parse_ipv4(
     payload_len: &mut usize,
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
+    tunnel: &mut Option<TunnelInfo>,
 ) {
     if data.len() < 20 {
         return;
@@ -382,7 +425,7 @@ fn parse_ipv4(
     if ihl <= total_len && ihl <= data.len() {
         let transport_data = &data[ihl..];
         let transport_len = total_len.saturating_sub(ihl);
-        parse_transport(proto, transport_data, transport_len, encap, src, dst, l4_proto, header_len, payload_len, tcp_flags, l7);
+        parse_transport(proto, transport_data, transport_len, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel);
     }
 }
 
@@ -399,6 +442,7 @@ fn parse_ipv6(
     payload_len: &mut usize,
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
+    tunnel: &mut Option<TunnelInfo>,
 ) {
     if data.len() < 40 {
         return;
@@ -417,7 +461,7 @@ fn parse_ipv6(
 
     if data.len() >= 40 {
         let transport_data = &data[40..];
-        parse_transport(next_header, transport_data, payload_length, encap, src, dst, l4_proto, header_len, payload_len, tcp_flags, l7);
+        parse_transport(next_header, transport_data, payload_length, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, tunnel);
     }
 }
 
@@ -429,11 +473,14 @@ fn parse_transport(
     encap: &mut Vec<String>,
     src: &mut Endpoint,
     dst: &mut Endpoint,
+    l3_proto: &mut L3Proto,
     l4_proto: &mut Option<L4Proto>,
+    ttl: &mut Option<u8>,
     header_len: &mut usize,
     payload_len: &mut usize,
     tcp_flags: &mut Option<TcpFlags>,
     l7: &mut Option<L7Info>,
+    tunnel: &mut Option<TunnelInfo>,
 ) {
     match proto {
         6 => {
@@ -480,6 +527,40 @@ fn parse_transport(
             *header_len += 8;
             *payload_len = udp_len.saturating_sub(8);
             let app_data = &data[8.min(data.len())..];
+
+            // VXLAN (port 4789): outer UDP wraps inner Ethernet frame
+            if (sport == 4789 || dport == 4789) && app_data.len() >= 8 {
+                let outer_src_ip = src.ip;
+                let outer_dst_ip = dst.ip;
+                let vni_valid = app_data[0] & 0x08 != 0;
+                let vni = ((app_data[4] as u32) << 16)
+                    | ((app_data[5] as u32) << 8)
+                    | (app_data[6] as u32);
+                encap.push("VXLAN".to_string());
+                src.port = None;
+                dst.port = None;
+                if let (Some(osrc), Some(odst)) = (outer_src_ip, outer_dst_ip) {
+                    *tunnel = Some(TunnelInfo {
+                        proto: TunnelProto::Vxlan,
+                        outer_src: osrc,
+                        outer_dst: odst,
+                        tunnel_id: if vni_valid { Some(vni) } else { None },
+                    });
+                }
+                let inner_eth = &app_data[8..];
+                if inner_eth.len() > 14 {
+                    encap.push("Ethernet".to_string());
+                    let mut inner_tunnel = None;
+                    parse_ip(
+                        &inner_eth[14..],
+                        encap, src, dst, l3_proto, l4_proto, ttl,
+                        header_len, payload_len, tcp_flags, l7,
+                        &mut inner_tunnel,
+                    );
+                }
+                return;
+            }
+
             *l7 = application::decode_l7_udp(sport, dport, app_data);
             if let Some(ref info) = l7 {
                 encap.push(info.proto_name().to_string());
@@ -498,6 +579,100 @@ fn parse_transport(
             *l4_proto = Some(L4Proto::Icmpv6);
             *header_len += 8;
             *payload_len = transport_len.saturating_sub(8);
+        }
+        // IP-in-IP (proto 4): outer IPv4 wraps inner IPv4
+        4 => {
+            let outer_src_ip = src.ip;
+            let outer_dst_ip = dst.ip;
+            encap.push("IPIP".to_string());
+            src.port = None;
+            dst.port = None;
+            if let (Some(osrc), Some(odst)) = (outer_src_ip, outer_dst_ip) {
+                *tunnel = Some(TunnelInfo {
+                    proto: TunnelProto::IpIp,
+                    outer_src: osrc,
+                    outer_dst: odst,
+                    tunnel_id: None,
+                });
+            }
+            let mut inner_tunnel = None;
+            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+        }
+        // IPv6-in-IPv4 (proto 41): 6in4 tunnel
+        41 => {
+            let outer_src_ip = src.ip;
+            let outer_dst_ip = dst.ip;
+            encap.push("6in4".to_string());
+            src.port = None;
+            dst.port = None;
+            if let (Some(osrc), Some(odst)) = (outer_src_ip, outer_dst_ip) {
+                *tunnel = Some(TunnelInfo {
+                    proto: TunnelProto::Ipv6InIp,
+                    outer_src: osrc,
+                    outer_dst: odst,
+                    tunnel_id: None,
+                });
+            }
+            let mut inner_tunnel = None;
+            parse_ip(data, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+        }
+        // GRE (proto 47): Generic Routing Encapsulation
+        47 => {
+            if data.len() < 4 {
+                *l4_proto = Some(L4Proto::Other(47));
+                return;
+            }
+            let gre_flags = u16::from_be_bytes([data[0], data[1]]);
+            let proto_type = u16::from_be_bytes([data[2], data[3]]);
+            let checksum_present = gre_flags & 0x8000 != 0;
+            let key_present     = gre_flags & 0x2000 != 0;
+            let seq_present     = gre_flags & 0x1000 != 0;
+
+            let mut offset = 4usize;
+            if checksum_present { offset = offset.saturating_add(4); }
+            let gre_key = if key_present && data.len() >= offset + 4 {
+                let k = u32::from_be_bytes([
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                ]);
+                offset += 4;
+                Some(k)
+            } else {
+                if key_present { offset = offset.saturating_add(4); }
+                None
+            };
+            if seq_present { offset = offset.saturating_add(4); }
+
+            let outer_src_ip = src.ip;
+            let outer_dst_ip = dst.ip;
+            encap.push("GRE".to_string());
+            src.port = None;
+            dst.port = None;
+            if let (Some(osrc), Some(odst)) = (outer_src_ip, outer_dst_ip) {
+                *tunnel = Some(TunnelInfo {
+                    proto: TunnelProto::Gre,
+                    outer_src: osrc,
+                    outer_dst: odst,
+                    tunnel_id: gre_key,
+                });
+            }
+
+            if offset < data.len() {
+                let inner = &data[offset..];
+                let mut inner_tunnel = None;
+                match proto_type {
+                    0x0800 | 0x86DD => {
+                        parse_ip(inner, encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+                    }
+                    0x6558 => {
+                        // Transparent Ethernet Bridging in GRE
+                        if inner.len() > 14 {
+                            encap.push("Ethernet".to_string());
+                            parse_ip(&inner[14..], encap, src, dst, l3_proto, l4_proto, ttl, header_len, payload_len, tcp_flags, l7, &mut inner_tunnel);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         _ => {
             *l4_proto = Some(L4Proto::Other(proto));
@@ -852,5 +1027,255 @@ mod tests {
         let raw = eth_ipv4_icmp([1,2,3,4],[5,6,7,8]);
         let p = decode(&raw);
         assert_eq!(p.proto_label(), "ICMP");
+    }
+
+    // ── tunnel builders ───────────────────────────────────────────────────────
+
+    /// Ethernet + outer IPv4 + inner IPv4 (IPIP, proto 4) + UDP payload.
+    fn ipip_packet(
+        outer_src: [u8; 4], outer_dst: [u8; 4],
+        inner_src: [u8; 4], inner_dst: [u8; 4],
+        inner_sport: u16, inner_dport: u16,
+    ) -> RawPacket {
+        let udp_payload = b"hello";
+        let inner_udp_len = (8 + udp_payload.len()) as u16;
+        let inner_ip_len = (20 + inner_udp_len as usize) as u16;
+        let outer_ip_total = (20 + 20 + 8 + udp_payload.len()) as u16;
+
+        let mut data = Vec::new();
+        // Outer Ethernet
+        data.extend_from_slice(&[0xaa; 6]); // dst MAC
+        data.extend_from_slice(&[0xbb; 6]); // src MAC
+        data.extend_from_slice(&[0x08, 0x00]); // IPv4
+        // Outer IPv4
+        data.push(0x45);
+        data.push(0x00);
+        data.push((outer_ip_total >> 8) as u8); data.push((outer_ip_total & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // id, flags/frag
+        data.push(64); // TTL
+        data.push(4);  // proto = IPIP
+        data.extend_from_slice(&[0x00, 0x00]); // checksum
+        data.extend_from_slice(&outer_src);
+        data.extend_from_slice(&outer_dst);
+        // Inner IPv4
+        data.push(0x45);
+        data.push(0x00);
+        data.push((inner_ip_len >> 8) as u8); data.push((inner_ip_len & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x02, 0x00, 0x00]);
+        data.push(128); // inner TTL
+        data.push(17);  // UDP
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.extend_from_slice(&inner_src);
+        data.extend_from_slice(&inner_dst);
+        // Inner UDP
+        data.push((inner_sport >> 8) as u8); data.push((inner_sport & 0xff) as u8);
+        data.push((inner_dport >> 8) as u8); data.push((inner_dport & 0xff) as u8);
+        data.push((inner_udp_len >> 8) as u8); data.push((inner_udp_len & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x00]); // checksum
+        data.extend_from_slice(udp_payload);
+
+        RawPacket {
+            data,
+            ts_sec: 0, ts_usec: 0,
+            _caplen: 0, origlen: 0,
+            datalink: 1,
+        }
+    }
+
+    /// Ethernet + outer IPv4 + GRE (no key) + inner IPv4 + ICMP.
+    fn gre_packet(
+        outer_src: [u8; 4], outer_dst: [u8; 4],
+        inner_src: [u8; 4], inner_dst: [u8; 4],
+    ) -> RawPacket {
+        let inner_icmp_len = 8usize;
+        let inner_ip_total = (20 + inner_icmp_len) as u16;
+        let outer_ip_total = (20 + 4 + 20 + inner_icmp_len) as u16; // GRE hdr = 4
+
+        let mut data = Vec::new();
+        // Outer Ethernet
+        data.extend_from_slice(&[0xcc; 6]);
+        data.extend_from_slice(&[0xdd; 6]);
+        data.extend_from_slice(&[0x08, 0x00]);
+        // Outer IPv4
+        data.push(0x45); data.push(0x00);
+        data.push((outer_ip_total >> 8) as u8); data.push((outer_ip_total & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]);
+        data.push(64); data.push(47); // proto = GRE
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.extend_from_slice(&outer_src);
+        data.extend_from_slice(&outer_dst);
+        // GRE header (no flags, IPv4 payload)
+        data.extend_from_slice(&[0x00, 0x00]); // flags = 0
+        data.extend_from_slice(&[0x08, 0x00]); // proto = IPv4
+        // Inner IPv4
+        data.push(0x45); data.push(0x00);
+        data.push((inner_ip_total >> 8) as u8); data.push((inner_ip_total & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x04, 0x00, 0x00]);
+        data.push(128); data.push(1); // ICMP
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.extend_from_slice(&inner_src);
+        data.extend_from_slice(&inner_dst);
+        // ICMP echo
+        data.extend_from_slice(&[0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01]);
+
+        RawPacket {
+            data,
+            ts_sec: 0, ts_usec: 0,
+            _caplen: 0, origlen: 0,
+            datalink: 1,
+        }
+    }
+
+    /// Ethernet + outer IPv4 + UDP + VXLAN + inner Ethernet + inner IPv4 + TCP.
+    fn vxlan_packet(
+        outer_src: [u8; 4], outer_dst: [u8; 4],
+        vni: u32,
+        inner_src: [u8; 4], inner_dst: [u8; 4],
+        inner_sport: u16, inner_dport: u16,
+    ) -> RawPacket {
+        let inner_tcp_len = 20usize;
+        let inner_ip_total = (20 + inner_tcp_len) as u16;
+        // inner Ethernet(14) + inner IPv4(20) + inner TCP(20) = 54
+        let inner_eth_frame_len = 14 + 20 + inner_tcp_len;
+        let vxlan_payload_len = 8 + inner_eth_frame_len; // VXLAN hdr + inner Ethernet
+        let udp_len = (8 + vxlan_payload_len) as u16;
+        let outer_ip_total = (20 + udp_len as usize) as u16;
+
+        let mut data = Vec::new();
+        // Outer Ethernet
+        data.extend_from_slice(&[0x11; 6]);
+        data.extend_from_slice(&[0x22; 6]);
+        data.extend_from_slice(&[0x08, 0x00]);
+        // Outer IPv4
+        data.push(0x45); data.push(0x00);
+        data.push((outer_ip_total >> 8) as u8); data.push((outer_ip_total & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x05, 0x00, 0x00]);
+        data.push(64); data.push(17); // UDP
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.extend_from_slice(&outer_src);
+        data.extend_from_slice(&outer_dst);
+        // Outer UDP (src arbitrary, dst 4789)
+        data.extend_from_slice(&[0xc0, 0x00]); // src port 49152
+        data.extend_from_slice(&[0x12, 0xb5]); // dst port 4789
+        data.push((udp_len >> 8) as u8); data.push((udp_len & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x00]);
+        // VXLAN header: flags (VNI valid = 0x08), reserved(3), VNI(3), reserved(1)
+        data.push(0x08); data.extend_from_slice(&[0x00, 0x00, 0x00]);
+        data.push(((vni >> 16) & 0xff) as u8);
+        data.push(((vni >> 8) & 0xff) as u8);
+        data.push((vni & 0xff) as u8);
+        data.push(0x00);
+        // Inner Ethernet
+        data.extend_from_slice(&[0x33; 6]); // dst MAC
+        data.extend_from_slice(&[0x44; 6]); // src MAC
+        data.extend_from_slice(&[0x08, 0x00]); // IPv4
+        // Inner IPv4
+        data.push(0x45); data.push(0x00);
+        data.push((inner_ip_total >> 8) as u8); data.push((inner_ip_total & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x06, 0x00, 0x00]);
+        data.push(64); data.push(6); // TCP
+        data.extend_from_slice(&[0x00, 0x00]);
+        data.extend_from_slice(&inner_src);
+        data.extend_from_slice(&inner_dst);
+        // Inner TCP
+        data.push((inner_sport >> 8) as u8); data.push((inner_sport & 0xff) as u8);
+        data.push((inner_dport >> 8) as u8); data.push((inner_dport & 0xff) as u8);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // seq
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ack
+        data.push(0x50); // data offset = 5 (20 bytes)
+        data.push(0x02); // SYN
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // window, checksum, urgent
+
+        RawPacket {
+            data,
+            ts_sec: 0, ts_usec: 0,
+            _caplen: 0, origlen: 0,
+            datalink: 1,
+        }
+    }
+
+    // ── tunnel decode tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_ipip_tunnel_detected() {
+        let raw = ipip_packet(
+            [10, 0, 0, 1], [10, 0, 0, 2],
+            [192, 168, 1, 1], [192, 168, 1, 2],
+            50000, 53,
+        );
+        let p = decode(&raw);
+
+        let tun = p.tunnel.as_ref().expect("tunnel must be detected for IPIP");
+        assert_eq!(tun.proto, TunnelProto::IpIp);
+        assert_eq!(tun.outer_src.to_string(), "10.0.0.1");
+        assert_eq!(tun.outer_dst.to_string(), "10.0.0.2");
+        assert_eq!(tun.tunnel_id, None);
+
+        // Inner endpoints should be visible in packet src/dst
+        assert_eq!(p.src.ip.unwrap().to_string(), "192.168.1.1");
+        assert_eq!(p.dst.ip.unwrap().to_string(), "192.168.1.2");
+        assert_eq!(p.l4_proto, Some(L4Proto::Udp));
+
+        assert!(p.encap_chain.contains(&"IPIP".to_string()));
+        assert!(p.encap_chain.contains(&"IPv4".to_string()));
+        assert!(p.encap_chain.contains(&"UDP".to_string()));
+    }
+
+    #[test]
+    fn test_gre_tunnel_detected() {
+        let raw = gre_packet(
+            [172, 16, 0, 1], [172, 16, 0, 2],
+            [10, 1, 1, 1], [10, 1, 1, 2],
+        );
+        let p = decode(&raw);
+
+        let tun = p.tunnel.as_ref().expect("tunnel must be detected for GRE");
+        assert_eq!(tun.proto, TunnelProto::Gre);
+        assert_eq!(tun.outer_src.to_string(), "172.16.0.1");
+        assert_eq!(tun.outer_dst.to_string(), "172.16.0.2");
+        assert_eq!(tun.tunnel_id, None); // no GRE key in this packet
+
+        // Inner ICMP endpoints
+        assert_eq!(p.src.ip.unwrap().to_string(), "10.1.1.1");
+        assert_eq!(p.dst.ip.unwrap().to_string(), "10.1.1.2");
+        assert_eq!(p.l4_proto, Some(L4Proto::Icmp));
+
+        assert!(p.encap_chain.contains(&"GRE".to_string()));
+        assert!(p.encap_chain.contains(&"ICMP".to_string()));
+    }
+
+    #[test]
+    fn test_vxlan_tunnel_detected() {
+        let raw = vxlan_packet(
+            [192, 168, 100, 1], [192, 168, 100, 2],
+            12345,
+            [10, 10, 0, 1], [10, 10, 0, 2],
+            50001, 80,
+        );
+        let p = decode(&raw);
+
+        let tun = p.tunnel.as_ref().expect("tunnel must be detected for VXLAN");
+        assert_eq!(tun.proto, TunnelProto::Vxlan);
+        assert_eq!(tun.outer_src.to_string(), "192.168.100.1");
+        assert_eq!(tun.outer_dst.to_string(), "192.168.100.2");
+        assert_eq!(tun.tunnel_id, Some(12345));
+        assert_eq!(tun.id_label().as_deref(), Some("VNI 12345"));
+
+        // Inner TCP endpoints
+        assert_eq!(p.src.ip.unwrap().to_string(), "10.10.0.1");
+        assert_eq!(p.dst.ip.unwrap().to_string(), "10.10.0.2");
+        assert_eq!(p.src.port, Some(50001));
+        assert_eq!(p.dst.port, Some(80));
+        assert_eq!(p.l4_proto, Some(L4Proto::Tcp));
+
+        assert!(p.encap_chain.contains(&"VXLAN".to_string()));
+        assert!(p.encap_chain.contains(&"TCP".to_string()));
+    }
+
+    #[test]
+    fn test_non_tunnel_packet_has_no_tunnel_info() {
+        let raw = eth_ipv4_tcp([1, 2, 3, 4], [5, 6, 7, 8], 12345, 443, 0x02, b"");
+        let p = decode(&raw);
+        assert!(p.tunnel.is_none());
     }
 }

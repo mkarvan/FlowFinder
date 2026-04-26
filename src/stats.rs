@@ -190,6 +190,7 @@ mod tests {
             payload_len: len.saturating_sub(54),
             tcp_flags: None,
             l7: None,
+            tunnel: None,
         }
     }
 
