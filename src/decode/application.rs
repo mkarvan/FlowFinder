@@ -99,11 +99,17 @@ fn parse_tls(data: &[u8]) -> Option<L7Info> {
         });
     }
 
-    // Parse ClientHello to extract SNI
+    // For ClientHello, use the version from the handshake body (offset 9-10),
+    // not the record layer (offset 1-2), which is fixed at 0x0301 for compat.
+    let client_version = if data.len() >= 11 {
+        tls_version_str(data[9], data[10])
+    } else {
+        version
+    };
     let sni = extract_sni(data);
     Some(L7Info::Tls {
         sni,
-        version: version.to_string(),
+        version: client_version.to_string(),
         handshake: "ClientHello".to_string(),
     })
 }
