@@ -103,8 +103,8 @@ fn render(f: &mut Frame, app: &mut AppState) {
         Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
             .areas(main_area);
 
-    // Left: packet list (top 55%) + flow detail (bottom 45%)
-    let [packets_area, detail_area] =
+    // Left: top list pane (55%) + bottom detail/summary pane (45%)
+    let [list_area, bottom_area] =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
             .areas(left_area);
 
@@ -113,8 +113,15 @@ fn render(f: &mut Frame, app: &mut AppState) {
         Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)])
             .areas(right_area);
 
-    widgets::packet_list::render(f, packets_area, app);
-    widgets::flow_detail::render(f, detail_area, app);
+    // Top-left: flow list or per-flow packet list depending on drill-down state
+    if app.open_flow.is_some() {
+        widgets::flow_packets::render(f, list_area, app);
+        widgets::flow_detail::render(f, bottom_area, app);
+    } else {
+        widgets::flow_list::render(f, list_area, app);
+        widgets::flow_summary::render(f, bottom_area, app);
+    }
+
     widgets::bandwidth::render(f, bandwidth_area, app);
     widgets::protocol_chart::render(f, proto_area, app);
     render_status(f, status_area, app);
@@ -136,10 +143,16 @@ fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &AppState) {
         String::new()
     };
 
+    let nav_hint = if app.open_flow.is_some() {
+        Span::styled("[esc] back ", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled("[↵] open ", Style::default().fg(Color::DarkGray))
+    };
+
     let mut spans = vec![
         Span::styled(" [q]uit ", Style::default().fg(Color::DarkGray)),
         Span::styled("[p]ause ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[tab]focus ", Style::default().fg(Color::DarkGray)),
+        nav_hint,
         Span::styled("[f]ilter ", Style::default().fg(Color::DarkGray)),
         Span::styled("[c]lear ", Style::default().fg(Color::DarkGray)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),

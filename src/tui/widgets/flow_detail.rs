@@ -10,7 +10,7 @@ use crate::decode::{L7Info, TunnelInfo};
 use crate::tui::app::{AppState, FocusPane};
 
 pub fn render(f: &mut Frame, area: Rect, app: &AppState) {
-    let focused = app.focus == FocusPane::FlowDetail;
+    let focused = app.focus == FocusPane::Detail;
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {

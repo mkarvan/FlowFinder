@@ -27,25 +27,87 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, filter_tx: &Sender<Option<S
                 app.filter_input = Some(String::new());
             }
         }
+        KeyCode::Esc => {
+            if app.open_flow.is_some() {
+                app.close_flow();
+            }
+        }
+        KeyCode::Enter => {
+            if app.open_flow.is_none() {
+                app.open_selected_flow();
+            }
+        }
         KeyCode::Char('G') => {
-            app.auto_scroll = true;
-            app.selected = app.packets.len().saturating_sub(1);
+            if app.open_flow.is_some() {
+                let max = app
+                    .open_flow_entry()
+                    .map(|e| e.packets.len().saturating_sub(1))
+                    .unwrap_or(0);
+                app.flow_pkt_sel = max;
+                app.pkt_auto_scroll = true;
+            } else {
+                app.selected_flow = app.flow_table.len().saturating_sub(1);
+                app.flow_auto_scroll = true;
+            }
         }
         KeyCode::Char('g') => {
-            app.auto_scroll = false;
-            app.selected = 0;
+            if app.open_flow.is_some() {
+                app.flow_pkt_sel = 0;
+                app.pkt_auto_scroll = false;
+            } else {
+                app.selected_flow = 0;
+                app.flow_auto_scroll = false;
+            }
         }
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
-        KeyCode::PageUp => app.page_up(20),
-        KeyCode::PageDown => app.page_down(20),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.open_flow.is_some() {
+                app.scroll_pkt_up();
+            } else {
+                app.scroll_flow_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.open_flow.is_some() {
+                app.scroll_pkt_down();
+            } else {
+                app.scroll_flow_down();
+            }
+        }
+        KeyCode::PageUp => {
+            if app.open_flow.is_some() {
+                app.page_pkt_up(20);
+            } else {
+                app.page_flow_up(20);
+            }
+        }
+        KeyCode::PageDown => {
+            if app.open_flow.is_some() {
+                app.page_pkt_down(20);
+            } else {
+                app.page_flow_down(20);
+            }
+        }
         KeyCode::Home => {
-            app.auto_scroll = false;
-            app.selected = 0;
+            if app.open_flow.is_some() {
+                app.flow_pkt_sel = 0;
+                app.pkt_auto_scroll = false;
+            } else {
+                app.selected_flow = 0;
+                app.flow_auto_scroll = false;
+            }
         }
         KeyCode::End => {
-            app.auto_scroll = true;
-            app.selected = app.packets.len().saturating_sub(1);
+            if app.open_flow.is_some() {
+                let max = app
+                    .open_flow_entry()
+                    .map(|e| e.packets.len().saturating_sub(1))
+                    .unwrap_or(0);
+                app.flow_pkt_sel = max;
+                app.pkt_auto_scroll = true;
+            } else {
+                app.selected_flow = app.flow_table.len().saturating_sub(1);
+                app.flow_auto_scroll = true;
+            }
         }
         _ => {}
     }
